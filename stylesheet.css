@@ -144,25 +144,28 @@ span.highlight {
 
 /* ---------- Dark Theme Override ---------- */
 
+/* ---------- Soft Dark Theme (Academic) ---------- */
+
 body {
-  background-color: #0f1115;
-  color: #c9d1d9;
+  background-color: #181a1f;   /* soft charcoal, not black */
+  color: #d6d6d6;              /* light gray text */
 }
 
 a {
-  color: #58a6ff;
+  color: #6aa9ff;              /* muted blue */
 }
 
 a:hover,
 a:focus {
-  color: #f0a45d;
+  color: #f2a365;              /* warm accent */
 }
 
 h2,
 .name {
-  color: #e6edf3;
+  color: #f0f0f0;              /* slightly brighter headings */
 }
 
 span.highlight {
-  background-color: #2a2f3a;
+  background-color: #2a2e36;
 }
+
