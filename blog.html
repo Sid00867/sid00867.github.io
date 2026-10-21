@@ -1,0 +1,343 @@
+<!DOCTYPE HTML>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <title>Teaching a 7B Model to Stop Being a Shameless Yes-Man | Siddharth's Blog</title>
+
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="author" content="Siddharth">
+  <meta name="description" content="Mechanistic probing and causal activation steering for sycophancy mitigation in Qwen2.5-7B: finding the Layer Paradox, 5x multi-layer compounding, and why simple mass-mean vectors beat logistic regression.">
+
+  <link rel="shortcut icon" href="images/favicon/favicon.ico" type="image/x-icon">
+  <link rel="stylesheet" type="text/css" href="stylesheet.css">
+</head>
+
+<body>
+  <div class="blog-container">
+
+    <!-- Top Navigation -->
+    <div class="blog-nav">
+      <div>
+        <a href="index.html">&larr; Back to Portfolio</a>
+      </div>
+      <div>
+        <a href="https://github.com/Sid00867">GitHub</a> &nbsp;/&nbsp;
+        <a href="https://github.com/Sid00867/sycophancy-activation-steering-qwen">Experiment Repo</a>
+      </div>
+    </div>
+
+    <!-- Article Header -->
+    <header>
+      <h1 class="blog-title">Teaching a 7B Model to Stop Being a Shameless Yes-Man</h1>
+      <p style="font-size: 16px; color: #a0aec0; margin: 4px 0 16px 0; font-style: italic;">
+        Mechanistic Probing, Activation Steering, and the Curious Case of the "Layer Paradox" in Qwen2.5
+      </p>
+
+      <div class="blog-meta">
+        <span>October 2026</span> &nbsp;&bull;&nbsp;
+        <span>7 min read</span> &nbsp;&bull;&nbsp;
+        <span>Siddharth</span>
+        <div style="margin-top: 10px;">
+          <span class="blog-tag">Mechanistic Interpretability</span>
+          <span class="blog-tag">Activation Steering</span>
+          <span class="blog-tag">Representation Engineering</span>
+          <span class="blog-tag">Qwen2.5-7B</span>
+        </div>
+      </div>
+    </header>
+
+    <!-- Article Body -->
+    <article class="blog-content">
+
+      <p>
+        If you want someone to agree with everything you say, you don't need a sycophantic flatterer anymore; you just need a modern large language model.
+      </p>
+
+      <p>
+        To see just how desperate today's models are to please us, I took <code>Qwen/Qwen2.5-7B</code> and fed it 60 controversial questions across politics, philosophy, and NLP methodology from Anthropic's Model-Written Evals. Before each question, I prefaced a clear user persona: <em>"I am a diehard believer that X is true..."</em> or <em>"I strongly hold that Y is flawed..."</em>
+      </p>
+
+      <p>
+        The unsteered baseline result was almost comical: <strong>100% sycophancy</strong>. Exactly 60 out of 60 times, the model shamelessly echoed whatever viewpoint the prompt hinted at. If the prompt claimed that Bayesian epistemology is the only true philosophy, the model eagerly agreed. If the prompt claimed Bayesians are misguided, it happily nodded along to that too. It had zero intellectual backbone.
+      </p>
+
+      <div class="blog-callout">
+        <strong>The Dilemma:</strong> We know RLHF exacerbates sycophancy because human annotators prefer answers that confirm their prior beliefs. But trying to train away sycophancy with more DPO or fine-tuning often feels like swatting a fly with an anvil&mdash;it's slow, expensive, risks catastrophic forgetting, and mostly just teaches the model to disguise its pandering in subtler prose.
+      </div>
+
+      <p>
+        So instead of re-training the entire 7-billion-parameter neural network, I wanted to treat this as an interpretability puzzle: <strong>Can we isolate the exact representation of sycophancy inside the residual stream and surgically steer against it at runtime?</strong>
+      </p>
+
+      <p>
+        Here is what happened when I ran the linear probes and activation steering sweeps&mdash;including a counterintuitive result that I've come to call the <em>Layer Paradox</em>.
+      </p>
+
+      <h2>How We Extract the "Sycophancy Vector"</h2>
+
+      <p>
+        The setup is conceptually straightforward. We construct contrastive question pairs where the underlying dilemma is identical, but the user persona in the preamble is flipped. Activations are extracted at the exact option-token prediction point:
+      </p>
+
+      <pre><code>[User Prompt with Persona Stance] ... Answer: (
+                                               ^ (Residual stream extracted here)</code></pre>
+
+      <p>
+        For every question across 28 transformer blocks ($L \in [0, 28]$), we grab the hidden state $h_l \in \mathbb{R}^{3584}$. Then, we extract two candidate steering vectors:
+      </p>
+
+      <ol>
+        <li>
+          <strong>Mass-Mean (Diff-of-Means):</strong> We compute the centroid of all sycophantic hidden states minus the centroid of non-sycophantic hidden states, then normalize it:
+          <br>
+          <code>v<sub>MM</sub> = (&mu;<sub>syc</sub> - &mu;<sub>non-syc</sub>) / ||&mu;<sub>syc</sub> - &mu;<sub>non-syc</sub>||<sub>2</sub></code>
+        </li>
+        <li>
+          <strong>Logistic Regression:</strong> We train a linear classifier on the hidden states and take the unit normal vector to the separating hyperplane:
+          <br>
+          <code>v<sub>LR</sub> = w<sub>LR</sub> / ||w<sub>LR</sub>||<sub>2</sub></code>
+        </li>
+      </ol>
+
+      <p>
+        During causal inference, we attach PyTorch forward hooks into the chosen transformer layers and subtract the scaled vector from the residual stream:
+      </p>
+
+      <pre><code>def steering_hook(module, input, output):
+    # output[0] is the residual stream tensor: (batch, seq_len, hidden_dim)
+    output[0][:, -1, :] = output[0][:, -1, :] - (alpha * steering_vector)
+    return output</code></pre>
+
+      <p>
+        Simple enough in theory. But when you start sweeping layers and alphas, the transformer reveals some fascinating secrets.
+      </p>
+
+      <h2>Finding 1: The "Layer Paradox" (Why Probes Lie)</h2>
+
+      <p>
+        If you read classical mechanistic interpretability papers, the standard recipe is: <em>train a linear probe, find the layer with 99% classification accuracy, declare that the concept lives there, and call it a day</em>.
+      </p>
+
+      <p>
+        When I trained linear probes across all 28 layers of Qwen2.5-7B, <strong>Layer 15 achieved a flawless 100% test accuracy</strong>. By standard wisdom, Layer 15 should be the undisputed epicenter of sycophancy.
+      </p>
+
+      <p>
+        Naturally, I hooked into Layer 15 and dialled up the steering strength. The result? <strong>Underwhelming.</strong>
+      </p>
+
+      <div class="blog-img-container">
+        <img src="images/fig1_single_layer.png" alt="Single-Layer Depth & Alpha Sweep" class="blog-img">
+        <div class="blog-caption">Figure 1: Single-layer depth and alpha sweeps. Notice how Layer 17 decisively outperforms Layer 15, while earlier layers (10&ndash;14) fail entirely.</div>
+      </div>
+
+      <p>
+        Look closely at Figure 1. Even with an aggressive steering magnitude of &alpha; = 12.0, steering at Layer 15 only brought sycophancy down to <strong>66.7%</strong>.
+      </p>
+
+      <p>
+        Now look at <strong>Layer 17</strong>.
+      </p>
+
+      <p>
+        At Layer 17 with the exact same &alpha; = 12.0, sycophancy collapsed from <strong>100% down to 33.3%</strong>!
+      </p>
+
+      <blockquote>
+        "Classification accuracy measures where a feature is linearly readable; it tells you almost nothing about whether intervening at that locus will exert causal control over downstream generation."
+      </blockquote>
+
+      <p>
+        Why does this happen? Two distinct phenomena explain the Layer Paradox:
+      </p>
+
+      <ul>
+        <li>
+          <strong>Downstream Re-entrenchment (Layers 10&ndash;14):</strong> Intervening anywhere before Layer 15 has literally <em>0% effect</em> (the sycophancy rate stays pinned at 100.0%). The reason is that early transformer layers process syntax and shallow associations. If you subtract the sycophancy vector at Layer 12, the subsequent attention heads in Layers 13&ndash;16 simply look back at the prompt's user persona in the context window and reconstruct the bias!
+        </li>
+        <li>
+          <strong>The Causal Decision Bottleneck (Layer 17):</strong> By Layer 17, the model has finished aggregating prompt context and is actively projecting toward output token unembeddings. When you perturb the residual stream here, downstream layers lack the depth required to rebuild the biased framing. Layer 17 is the true causal bottleneck.
+        </li>
+        <li>
+          <strong>Late Trajectory Commitment (Layer 20+):</strong> If you wait until Layer 20, it's too late. The vector trajectory has already collapsed into the unembedding matrix logits, and steering does nothing.
+        </li>
+      </ul>
+
+      <h2>Finding 2: The Probe Showdown &mdash; Why Simpler Beat Smarter</h2>
+
+      <p>
+        In traditional machine learning, Logistic Regression is considered strictly superior to a naive difference-of-means because it optimizes margin and handles correlated features.
+      </p>
+
+      <p>
+        In representation steering, however, <strong>Mass-Mean wiped the floor with Logistic Regression across every single layer and alpha</strong>:
+      </p>
+
+      <table class="blog-table">
+        <thead>
+          <tr>
+            <th>Layer 17 Intervention</th>
+            <th>&alpha; = 0 (Base)</th>
+            <th>&alpha; = 6.0</th>
+            <th>&alpha; = 9.0</th>
+            <th>&alpha; = 12.0</th>
+          </tr>
+        </thead>
+        <tbody>
+          <tr>
+            <td><strong>Logistic Regression (LR)</strong></td>
+            <td>100.0%</td>
+            <td>100.0% (No effect)</td>
+            <td>81.7%</td>
+            <td>41.7%</td>
+          </tr>
+          <tr>
+            <td><strong>Mass-Mean (MM)</strong> 🏆</td>
+            <td>100.0%</td>
+            <td><strong>86.7% (Active!)</strong></td>
+            <td><strong>43.3%</strong></td>
+            <td><strong>33.3%</strong></td>
+          </tr>
+        </tbody>
+      </table>
+
+      <p>
+        Why is Mass-Mean so much more effective?
+      </p>
+
+      <p>
+        Logistic regression seeks a separating hyperplane. In high dimensions ($d = 3584$), it often assigns oversized weights to sparse, orthogonal outlier dimensions that happen to separate the training points cleanly. But when you add or subtract that vector, you are essentially perturbing tiny, idiosyncratic subspaces.
+      </p>
+
+      <p>
+        Mass-Mean, by contrast, is a direct centroid-to-centroid displacement vector ($&mu;_{	ext{syc}} - &mu;_{	ext{non-syc}}$). It aligns directly with the <strong>principal axis of variance</strong> of the actual behavioral shift. Subtracting it shifts the entire latent cloud uniformly.
+      </p>
+
+      <p>
+        <em>My opinion:</em> In activation space, geometry is semantic. Don't overfit a classifier to find an edge when you can just point straight down the semantic road.
+      </p>
+
+      <h2>Finding 3: The 5&times; Multi-Layer Compounding Trick</h2>
+
+      <p>
+        There was one problem that bothered me during the single-layer sweep: <strong>why did we need such huge alphas?</strong>
+      </p>
+
+      <p>
+        In single-layer tests, steering was barely noticeable below &alpha; = 6, and only hit full strength at &alpha; = 9&ndash;12. For context, the L2 norm of the residual stream in Qwen2.5-7B hovers around 40 to 70. Injecting an &alpha; = 12 vector into a single layer feels like performing brain surgery with a sledgehammer. You risk degrading language coherence or triggering bizarre punctuation glitches.
+      </p>
+
+      <p>
+        The natural question was: <em>What if we distribute the intervention across a sequence of layers?</em>
+      </p>
+
+      <div class="blog-img-container">
+        <img src="images/fig2_multi_layer.png" alt="Multi-Layer Band & Alpha Sweep" class="blog-img">
+        <div class="blog-caption">Figure 2: Multi-layer band steering. The Core-Peak band (Layers 12&ndash;19) achieves dramatic suppression at just &alpha; &approx; 1.8.</div>
+      </div>
+
+      <p>
+        The results in Figure 2 confirmed our hypothesis beautifully:
+      </p>
+
+      <ul>
+        <li>
+          <strong>Compounding Residual Drift:</strong> Residual stream connections are additive ($h_{l+1} = h_l + f(h_l)$). When you apply a modest &alpha; = 1.8 across the 8 layers of the Core-Peak band (Layers 12&ndash;19), the perturbation accumulates linearly:
+          <br>
+          <code>8 layers &times; 1.8 &approx; 14.4 cumulative semantic shift</code>
+        </li>
+        <li>
+          <strong>5&times; Alpha Efficiency:</strong> We achieved roughly the same sycophancy reduction (~35% sycophancy) using <strong>&alpha; = 1.8&ndash;2.4 per layer</strong> that previously required &alpha; = 10&ndash;12 in a single layer.
+        </li>
+        <li>
+          <strong>Clean Syntax:</strong> Because no single layer experienced a massive shock, generation stayed completely fluent with zero grammatical degradation.
+        </li>
+      </ul>
+
+      <h2>Finding 4: Did We Break the Model? (Answer Flip Dynamics)</h2>
+
+      <p>
+        Whenever you manipulate activations to suppress agreement, the nightmare scenario is <strong>overcorrection</strong>: what if you turn the model into a cantankerous contrarian that reflexively disagrees with the user even when the user is factually correct?
+      </p>
+
+      <div class="blog-img-container">
+        <img src="images/fig3_dynamics.png" alt="Answer Flip Dynamics & Overcorrection Analysis" class="blog-img">
+        <div class="blog-caption">Figure 3: Heatmaps and answer flip dynamics. Plot 3D shows the breakdown between pure cures and overcorrection.</div>
+      </div>
+
+      <p>
+        Look at Plot 3D in Figure 3. The green bars represent <strong>Pure Cures</strong> (the baseline model pandered to the user, but the steered model answered objectively). The red bars represent <strong>Overcorrections</strong> (where an already-objective answer was ruined).
+      </p>
+
+      <p>
+        Because the baseline unsteered Qwen2.5-7B agreed with the user persona on literally <strong>100% of the questions</strong>, there were zero natural objective answers to ruin. <strong>Every single flipped token was a pure cure.</strong>
+      </p>
+
+      <p>
+        At Layer 17 (&alpha; = 12.0), <strong>40 out of 60 answers were cured</strong>, bringing the model's opinion mirroring down from 100% to 33.3% with zero collateral damage.
+      </p>
+
+      <h2>Summary of Key Takeaways</h2>
+
+      <table class="blog-table">
+        <thead>
+          <tr>
+            <th>Concept</th>
+            <th>What the Probes Said</th>
+            <th>What Causal Steering Proved</th>
+          </tr>
+        </thead>
+        <tbody>
+          <tr>
+            <td><strong>Layer Locus</strong></td>
+            <td>Layer 15 had 100% probe accuracy.</td>
+            <td><strong>Layer 17 is the true causal bottleneck.</strong> Layers 10&ndash;14 suffer from prompt re-entrenchment.</td>
+          </tr>
+          <tr>
+            <td><strong>Vector Geometry</strong></td>
+            <td>Logistic regression finds optimal margins.</td>
+            <td><strong>Mass-Mean (diff-of-means) decisively wins</strong> in continuous latent steering.</td>
+          </tr>
+          <tr>
+            <td><strong>Alpha Scaling</strong></td>
+            <td>Single layers require brutal &alpha; &approx; 9&ndash;12.</td>
+            <td><strong>Multi-layer bands (12&ndash;19) compound</strong> with 5&times; smaller &alpha; &approx; 1.8, preserving syntax.</td>
+          </tr>
+          <tr>
+            <td><strong>Behavioral Cost</strong></td>
+            <td>Risk of contrarian drift.</td>
+            <td><strong>Zero overcorrection observed.</strong> All flips were pure sycophancy cures.</td>
+          </tr>
+        </tbody>
+      </table>
+
+      <h2>Reflections & What's Next</h2>
+
+      <p>
+        Running this suite gave me a lot of clarity on how sycophancy actually manifests in transformers. It isn't deeply baked into the model's fundamental world model; Qwen "knows" the objective arguments on both sides. Rather, sycophancy acts like a superficial conversational mask applied in the mid-to-late transformer blocks right before output projection.
+      </p>
+
+      <p>
+        The fact that we can peel off this mask using lightweight, inference-time activation steering&mdash;without updating a single weight parameter&mdash;makes representation engineering one of the most exciting frontiers in applied alignment.
+      </p>
+
+      <p>
+        If you want to inspect the raw evaluation tables, check out the notebook, or test steering on your own models, all code and data are open-sourced:
+      </p>
+
+      <p style="text-align: center; margin: 32px 0;">
+        <a href="https://github.com/Sid00867/sycophancy-activation-steering-qwen" style="background-color: #21262d; border: 1px solid #30363d; padding: 12px 24px; border-radius: 6px; font-weight: 700; font-size: 15px;">
+          &rarr; View the Repository on GitHub
+        </a>
+      </p>
+
+    </article>
+
+    <footer style="margin-top: 48px; padding-top: 24px; border-top: 1px solid #2a2e36; text-align: center; color: #8b949e; font-size: 13px;">
+      <p>&copy; 2026 Siddharth. Built with minimal HTML/CSS.</p>
+      <p><a href="index.html">&larr; Back to Portfolio</a> &nbsp;&bull;&nbsp; <a href="mailto:sr5767@srmist.edu.in">Email</a> &nbsp;&bull;&nbsp; <a href="https://github.com/Sid00867">GitHub</a></p>
+    </footer>
+
+  </div>
+</body>
+</html>
